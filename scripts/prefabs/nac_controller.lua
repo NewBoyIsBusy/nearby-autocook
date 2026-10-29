@@ -32,7 +32,11 @@ local function fn()
         self.entity:SetParent(pot.entity)
         self.Network:SetClassifiedTarget(nil)
         self._pot:set(pot)
-        Bind(self)
+        -- A prefab post-init can attach us before the pot is registered in Ents;
+        -- reading the net_entity back in that frame may therefore return nil.
+        -- The server already has the authoritative entity reference.
+        self._bound = pot
+        pot._nac_controller = self
     end
     return inst
 end

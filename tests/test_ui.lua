@@ -15,6 +15,11 @@ local Widget = Class(function(self, name)
         local task = { fn=fn, Cancel=function(task) task.cancelled = true end }
         tasks[#tasks + 1] = task
         return task
+    end, DoTaskInTime = function(_, delay, fn)
+        assert(delay == 0)
+        local task = { fn=function(task) fn(); end, once=true, Cancel=function(task) task.cancelled=true end }
+        tasks[#tasks + 1] = task
+        return task
     end }
 end)
 function Widget:AddChild(child) self.children[child] = true; child.parent = self; return child end
@@ -35,7 +40,8 @@ function Widget:SetTextLengthLimit(value) self.limit = value end
 function Widget:SetCharacterFilter(value) self.characters = value end
 function Widget:SetForceEdit(value) self.force = value end
 for _, method in ipairs({ "SetRegionSize", "SetIdleTextColour", "SetEditTextColour",
-    "SetFocusedImage", "ScaleToSize" }) do Widget[method] = function() end end
+    "SetFocusedImage", "ScaleToSize", "SetFocusChangeDir", "SetPassControlToScreen" }) do Widget[method] = function() end end
+function Widget:OnControl() return false end
 local Text = Class(Widget, function(self, font, size, value)
     Widget._ctor(self, "text"); self:SetString(value)
 end)
@@ -121,7 +127,12 @@ local function Open(batch)
 end
 local function Tick(count)
     for _ = 1, count or 1 do
-        for _, task in ipairs(tasks) do if not task.cancelled then task.fn() end end
+        for _, task in ipairs(tasks) do
+            if not task.cancelled then
+                if task.once then task.cancelled = true end
+                task.fn()
+            end
+        end
     end
 end
 local function ChildCount(widget)
@@ -283,5 +294,237 @@ test("dedicated server installs no UI hooks", function()
     dedicated = true
     Install({GLOBAL=_G, AddClassPostConstruct=function() error("unexpected UI hook") end})
     dedicated = false
+end)
+
+test("native quantity field shows remaining quantity instead of original batch", function()
+    local pot, doer, widget = Fixture(30)
+    pot.wire = json.encode({batch=30, quantity=7, canmanage=true})
+    widget:Open(pot, doer)
+    assert(widget._nac_quantity.batch:GetString() == "7")
+end)
+
+-- Exercise the real management screen with a closed, actively cooking pot.
+CONTROL_CANCEL, MOVE_DOWN, MOVE_UP = 1, 2, 3
+local Screen = Class(Widget, function(self, name) Widget._ctor(self, name) end)
+package.loaded["widgets/screen"] = Screen
+package.loaded["widgets/redux/templates"] = {
+    BackgroundTint=function() return Widget("tint") end,
+    ScreenRoot=function() return Widget("root") end,
+    CurlyWindow=function(width, height, title, buttons)
+        local window = Widget("window")
+        window.buttons = buttons
+        window.actions = window:AddChild(Widget("actions"))
+        return window
+    end,
+}
+local panels = {}
+TheFrontEnd = {
+    PushScreen=function(_, screen) panels[#panels+1] = screen end,
+    PopScreen=function(_, screen)
+        for i=#panels,1,-1 do if panels[i] == screen then table.remove(panels,i) end end
+        screen:Kill()
+    end,
+}
+local ManageScreen = require("screens/nac_manage")
+local function Manage(quantity)
+    sent, tasks, panels = {}, {}, {}
+    local pot, player = Entity(), Entity()
+    pot.closed, pot.cooking = true, true
+    pot.state = {canmanage=true, batch=50, quantity=quantity or 6, status="正在烹饪"}
+    ThePlayer = player
+    local screen = ManageScreen(pot, function(command, batch)
+        sent[#sent+1] = {pot=pot, command=command, batch=batch}; return true
+    end, function(target) return target.state end, function(target, doer)
+        return target.valid and doer.valid and not doer:HasTag("playerghost")
+            and target.distsq <= 36 and target.state.canmanage
+    end)
+    player._nac_manage_screen = screen
+    TheFrontEnd:PushScreen(screen)
+    return pot, player, screen
+end
+
+test("closed cooking pot has a minimal remaining-quantity manager", function()
+    local pot, player, screen = Manage(4)
+    assert(pot.closed and pot.cooking and screen.batch:GetString() == "4")
+    assert(#screen.window.buttons == 2)
+    assert(screen.window.buttons[1].text == "取消配方" and screen.window.buttons[2].text == "关闭")
+    assert(#sent == 0)
+    screen.batch:SetEditing(true); screen.batch:SetString("3")
+    screen.batch.OnTextEntered()
+    assert(#sent == 1 and sent[1].command == "setbatch" and sent[1].batch == 3)
+end)
+
+test("manager accepts continuous zero and rejects malformed quantities", function()
+    local pot, player, screen = Manage()
+    for _, value in ipairs({"", "-1", "1.5", "10000", "0x10", "1e2", " 3"}) do
+        screen.batch:SetString(value); screen.batch.OnTextEntered()
+    end
+    assert(#sent == 0)
+    screen.batch:SetString("0"); screen.batch.OnTextEntered()
+    assert(#sent == 1 and sent[1].batch == 0)
+end)
+
+test("manager synchronizes remaining count without replacing typed input", function()
+    local pot, player, screen = Manage(8)
+    pot.state.quantity = 7; screen:OnUpdate(.2)
+    assert(screen.batch:GetString() == "7")
+    screen.batch:SetEditing(true); screen.batch:SetString("21")
+    pot.state.quantity = 6; screen:OnUpdate(.2)
+    assert(screen.batch:GetString() == "21")
+    screen.batch:OnLoseFocus(); screen:OnUpdate(.2)
+    assert(screen.batch:GetString() == "21" and #sent == 0)
+    Tick(); assert(#sent == 1 and sent[1].batch == 21)
+    screen:OnUpdate(.2); assert(screen.batch:GetString() == "21")
+    pot.state.quantity = 21; screen:OnUpdate(.2)
+    assert(screen._pending_quantity == nil and screen.batch:GetString() == "21")
+end)
+
+test("entering the displayed count still reapplies it after progress during editing", function()
+    local pot, player, screen = Manage(8)
+    screen.batch:SetEditing(true)
+    pot.state.quantity=7; screen:OnUpdate(.2)
+    assert(screen.batch:GetString() == "8")
+    screen.batch.OnTextEntered()
+    assert(#sent == 1 and sent[1].command == "setbatch" and sent[1].batch == 8)
+    screen.batch:OnLoseFocus(); Tick()
+    assert(#sent == 1)
+end)
+
+test("cancel button suppresses pending focus-save and clears only future recipe", function()
+    local pot, player, screen = Manage()
+    screen.batch:SetEditing(true); screen.batch:SetString("55")
+    screen.batch:OnLoseFocus()
+    screen.window.buttons[1].cb(); Tick()
+    assert(#sent == 1 and sent[1].command == "cancel" and sent[1].batch == nil)
+    assert(screen._closed and screen.killed and player._nac_manage_screen == nil)
+    assert(not screen.batch.force_active and #panels == 0)
+    screen.batch.OnTextEntered(); screen.batch:OnLoseFocus(); Tick()
+    assert(#sent == 1)
+end)
+
+test("manager Escape close and destruction never save an unfinished edit", function()
+    for _, close in ipairs({
+        function(screen) screen:OnControl(CONTROL_CANCEL, false) end,
+        function(screen) screen.window.buttons[2].cb() end,
+        function(screen) screen:Kill() end,
+    }) do
+        local pot, player, screen = Manage()
+        screen.batch:SetEditing(true); screen.batch:SetString("34")
+        screen.batch:OnLoseFocus(); close(screen); Tick()
+        assert(screen._closed and not screen.batch.force_active and #sent == 0)
+        assert(player._nac_manage_screen == nil)
+    end
+end)
+
+test("manager closes after distance death removal or task completion", function()
+    for _, cause in ipairs({"distance", "ghost", "removed", "player_removed", "finished"}) do
+        local pot, player, screen = Manage()
+        screen.batch:SetEditing(true); screen.batch:SetString("19")
+        if cause == "distance" then pot.distsq = 37
+        elseif cause == "ghost" then player.tags.playerghost = true
+        elseif cause == "removed" then pot.valid = false
+        elseif cause == "player_removed" then player.valid = false
+        else pot.state.canmanage = false end
+        screen:OnUpdate(.1); Tick()
+        assert(screen._closed and #sent == 0 and not screen.batch.force_active)
+    end
+end)
+
+-- Actual scene registration and server/client handoff, with game networking mocked.
+local action, collector, clienthandler, handlers, opened, allowed
+local clientrpc = {}
+TheWorld = {ismastersim=true}
+ActionHandler = function(act, state) return {action=act, state=state} end
+local actionenv = {
+    GLOBAL=_G,
+    AddAction=function(id, text, fn) action={id=id, text=text, fn=fn}; return action end,
+    AddComponentAction=function(kind, component, fn)
+        assert(kind == "SCENE" and component == "nearbyautocook"); collector = fn
+    end,
+    AddClientModRPCHandler=function(namespace, name, fn)
+        assert(namespace == "nearby_autocook" and name == "openmanage"); clienthandler=fn
+    end,
+    AddStategraphActionHandler=function(name, handler) handlers[name]=handler end,
+    GetClientModRPC=function(namespace, name)
+        assert(namespace == "nearby_autocook" and name == "openmanage"); return clientrpc
+    end,
+    SendModRPCToClient=function(id, userid, pot)
+        assert(id == clientrpc); opened[#opened+1]={userid=userid,pot=pot}
+    end,
+    GetModRPC=env.GetModRPC,
+    SendModRPCToServer=env.SendModRPCToServer,
+}
+handlers, opened, allowed = {}, {}, true
+require("nac_actions")(actionenv, function(player, pot) return allowed end)
+local function ActionFixture()
+    local pot, player, widget = Fixture(20)
+    pot.wire = json.encode({batch=20,quantity=4,canmanage=true,status="正在烹饪"})
+    pot.replica.container.CanBeOpened = function() return false end
+    pot.replica.container.IsOpenedBy = function() return false end
+    player.userid = "KU_test"
+    ThePlayer = player
+    return pot, player
+end
+
+test("right click action works during closed cooking without hijacking left harvest", function()
+    local pot, player = ActionFixture()
+    local harvest = {}
+    local left = {harvest}; collector(pot, player, left, false)
+    assert(#left == 1 and left[1] == harvest)
+    local right = {harvest}; collector(pot, player, right, true)
+    assert(#right == 2 and right[2] == action)
+    assert(action.id == "NAC_MANAGE" and action.priority == 2 and action.distance == 3)
+    assert(action.rmb and not action.instant and action.invalid_hold_action)
+    assert(handlers.wilson.state == "doshortaction" and handlers.wilson_client.state == "doshortaction")
+    assert(action.fn({doer=player,target=pot}) and opened[#opened].pot == pot)
+    allowed=false; assert(not action.fn({doer=player,target=pot})); allowed=true
+end)
+
+test("inactive inaccessible and unsupported pots do not offer management", function()
+    for _, cause in ipairs({"inactive", "readonly", "burnt", "ghost", "role", "unsynced"}) do
+        local pot, player = ActionFixture()
+        if cause == "inactive" then pot.wire = json.encode({canmanage=false})
+        elseif cause == "readonly" then pot.readonly=true
+        elseif cause == "burnt" then pot.tags.burnt=true
+        elseif cause == "ghost" then player.tags.playerghost=true
+        elseif cause == "role" then pot.tags.mastercookware=true
+        else pot._nac_controller=nil end
+        local actions={}; collector(pot, player, actions, true); assert(#actions == 0)
+    end
+end)
+
+test("server scene action reads authoritative component before controller binding", function()
+    local pot, player = ActionFixture()
+    local state = {canmanage=true,quantity=3}
+    pot.components = {nearbyautocook={GetState=function() return state end}}
+    pot._nac_controller = nil
+    local actions={}; collector(pot, player, actions, true)
+    assert(#actions == 1 and actions[1] == action)
+    SetState(pot, 30)
+    pot.wire = json.encode({canmanage=false,quantity=30})
+    actions={}; collector(pot, player, actions, true)
+    assert(#actions == 1 and actions[1] == action)
+    state.canmanage=false
+    pot.wire = json.encode({canmanage=true,quantity=30})
+    actions={}; collector(pot, player, actions, true); assert(#actions == 0)
+    TheWorld.ismastersim=false
+    actions={}; collector(pot, player, actions, true)
+    assert(#actions == 1 and actions[1] == action)
+    TheWorld.ismastersim=true
+end)
+
+test("client open RPC reaches real panel and sends current manager commands", function()
+    panels={}
+    local pot, player = ActionFixture()
+    clienthandler(pot)
+    local screen = player._nac_manage_screen
+    assert(screen and #panels == 1 and screen.batch:GetString() == "4")
+    clienthandler(pot); assert(#panels == 1)
+    screen.batch:SetString("2"); screen.batch.OnTextEntered()
+    assert(#sent == 1 and sent[1].command == "setbatch" and sent[1].batch == 2)
+    screen:CancelRecipe(); assert(#sent == 2 and sent[2].command == "cancel")
+    assert(#panels == 0 and player._nac_manage_screen == nil)
+    pot.distsq=37; clienthandler(pot); assert(#panels == 0)
+    pot.distsq=9; dedicated=true; clienthandler(pot); assert(#panels == 0); dedicated=false
 end)
 print("AUTOCOOK_UI_SUCCESS " .. passed)

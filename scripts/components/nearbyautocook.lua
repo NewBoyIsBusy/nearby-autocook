@@ -58,7 +58,9 @@ local NearbyAutocook = Class(function(self, inst)
         local result = self.original_harvest(component, ...)
         if result and self.collecting and not self.harvesting then
             self.collecting = false
-            if not self.enabled then self:Publish("已暂停，当前料理已收取") end
+            if not self.enabled then
+                self:Publish(self.recipe == nil and "已取消，当前料理已收取" or "已暂停，当前料理已收取")
+            end
         end
         return result
     end
@@ -70,9 +72,24 @@ local NearbyAutocook = Class(function(self, inst)
     self:Publish()
 end)
 
+function NearbyAutocook:CanManage()
+    return self.enabled and self.recipe ~= nil
+end
+
+function NearbyAutocook:HasPendingMeal()
+    local stewer = self.inst.components.stewer
+    return self.collecting and stewer ~= nil and (stewer:IsCooking() or stewer:IsDone())
+end
+
 function NearbyAutocook:GetState()
+    local canmanage = self:CanManage()
+    local quantity = self.batch
+    if canmanage then
+        quantity = self.remaining == -1 and 0 or self.remaining + (self:HasPendingMeal() and 1 or 0)
+    end
     return { recipe = Aggregate(self.recipe), enabled = self.enabled,
-        remaining = self.remaining, batch = self.batch, status = self.status }
+        remaining = self.remaining, batch = self.batch, status = self.status,
+        canmanage = canmanage, collecting = self.collecting, quantity = quantity }
 end
 
 function NearbyAutocook:Publish(status)
@@ -126,7 +143,23 @@ function NearbyAutocook:SetBatch(batch)
         return false
     end
     self.batch = batch
+    if self:CanManage() then
+        -- A live edit replaces the work still requested, including the current
+        -- uncollected meal. It never repeats already completed batches.
+        self.remaining = batch == 0 and -1 or math.max(0, batch - (self:HasPendingMeal() and 1 or 0))
+    end
     self:Publish()
+    return true
+end
+
+function NearbyAutocook:Cancel()
+    self.enabled = false
+    self.recipe = nil
+    self.remaining = 0
+    self.batch = 1
+    -- Native cooking has already consumed its ingredients. Keep responsibility
+    -- for that one result so it finishes and is stored without loss or duplication.
+    self:Publish(self:HasPendingMeal() and "已取消配方，当前一锅煮好后收存" or "配方已取消，可重新放料烹饪")
     return true
 end
 
@@ -208,7 +241,9 @@ function NearbyAutocook:Collect()
     end
     if result then
         self.collecting = false
-        if not self.enabled then self:Publish("已暂停，当前料理已收存") end
+        if not self.enabled then
+            self:Publish(self.recipe == nil and "已取消，当前料理已收存" or "已暂停，当前料理已收存")
+        end
     end
     return result == true
 end
@@ -346,7 +381,8 @@ function NearbyAutocook:OnLoad(data)
     self.batch = math.max(0, math.min(9999, math.floor(tonumber(data.batch) or 1)))
     self.enabled = data.enabled == true and self.recipe ~= nil
     self.collecting = data.collecting == true
-    self:Publish(self.enabled and "已恢复自动烹饪" or "已暂停")
+    self:Publish(self.enabled and "已恢复自动烹饪" or
+        (self.recipe == nil and (self.collecting and "已取消配方，当前一锅煮好后收存" or "配方已取消，可重新放料烹饪") or "已暂停"))
 end
 
 function NearbyAutocook:OnRemoveFromEntity()

@@ -10,7 +10,7 @@ from lupa.lua51 import LuaRuntime
 
 scripts = Path(os.environ.get("DST_SCRIPTS_PATH", ROOT / "game_scripts_reference/scripts"))
 syntax = LuaRuntime()
-files = list(SOURCE.rglob("*.lua"))
+files = [file for file in SOURCE.rglob("*.lua") if "dist" not in file.relative_to(SOURCE).parts]
 for file in files:
     syntax.execute("assert(loadstring(...))", file.read_text(encoding="utf-8"))
 print(f"AUTOCOOK_SYNTAX_SUCCESS {len(files)} files", flush=True)

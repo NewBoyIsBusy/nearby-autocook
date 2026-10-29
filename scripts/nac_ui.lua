@@ -32,11 +32,13 @@ return function(env)
         local raw = controller._state:value()
         if type(raw) ~= "string" or raw == "" then return nil end
         local ok, state = pcall(json.decode, raw)
-        if not ok or type(state) ~= "table" or type(state.batch) ~= "number"
-            or state.batch < 0 or state.batch > 9999 or state.batch ~= math.floor(state.batch) then
+        if not ok or type(state) ~= "table" then return nil end
+        local quantity = state.quantity ~= nil and state.quantity or state.batch
+        if type(quantity) ~= "number"
+            or quantity < 0 or quantity > 9999 or quantity ~= math.floor(quantity) then
             return nil
         end
-        return state.batch
+        return quantity
     end
 
     local function IsReadOnly(pot)
